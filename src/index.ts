@@ -258,6 +258,22 @@ function getEventToolName(event: unknown): string | null {
   return getToolNameFromValue(event);
 }
 
+/**
+ * The tool names Pi currently declares to the model. Falls back to every registered tool when the
+ * loaded Pi has no `getActiveTools()`, which is also what the previous behavior did.
+ */
+function getDeclaredToolNames(pi: ExtensionAPI): string[] {
+  const getActiveTools = (pi as { getActiveTools?: () => string[] }).getActiveTools;
+  if (typeof getActiveTools === "function") {
+    return getActiveTools.call(pi);
+  }
+
+  return pi
+    .getAllTools()
+    .map((tool) => getEventToolName(tool))
+    .filter((name): name is string => typeof name === "string" && name.length > 0);
+}
+
 function getEventInput(event: unknown): unknown {
   const record = toRecord(event);
 
@@ -1877,15 +1893,15 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     refreshExtensionConfig(ctx);
     startForwardedPermissionPolling(ctx);
     const agentName = resolveAgentName(ctx, event.systemPrompt);
-    const allTools = pi.getAllTools();
     const allowedTools: string[] = [];
+    // `setActiveTools()` declares exactly the names it receives, so start from what Pi declares right
+    // now instead of rebuilding the list from every registered tool: `getAllTools()` also contains
+    // tools Pi or another extension deliberately keeps inactive, such as the tools of a `deferred`
+    // MCP server that `tool_search` has not loaded yet. This handler removes denied tools; it must
+    // never declare a tool that nobody activated.
+    const declaredTools = getDeclaredToolNames(pi);
 
-    for (const tool of allTools) {
-      const toolName = getEventToolName(tool);
-      if (!toolName) {
-        continue;
-      }
-
+    for (const toolName of declaredTools) {
       if (shouldExposeTool(toolName, agentName)) {
         allowedTools.push(toolName);
       }

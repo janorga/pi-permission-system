@@ -117,6 +117,7 @@ type ExtensionHarness = {
   registeredEvents: string[];
   prompts: string[];
   debugPath: string;
+  setActiveToolsCalls: string[][];
   cleanup: () => Promise<void>;
 };
 
@@ -129,6 +130,10 @@ type ExtensionHarnessOptions = {
   notifications?: Array<{ message: string; level: string }>;
   extensionConfig?: PermissionSystemExtensionConfig;
   activeAgentName?: string | null;
+  /** Effective exposure per registered tool, as `getAllTools()` reports it. */
+  toolExposures?: Record<string, string>;
+  /** When set, the mock `pi` exposes `getActiveTools()` returning exactly these names. */
+  activeToolNames?: readonly string[];
 };
 
 const INHERITED_SUBAGENT_ENV_KEYS = [
@@ -186,6 +191,7 @@ function createToolCallHarness(
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   const originalConfigPath = process.env[CONFIG_PATH_ENV_KEY];
   const originalLogsDir = process.env[LOGS_DIR_ENV_KEY];
+  const setActiveToolsCalls: string[][] = [];
 
   mkdirSync(join(baseDir, "agents"), { recursive: true });
   mkdirSync(cwd, { recursive: true });
@@ -206,8 +212,16 @@ function createToolCallHarness(
         handlers[name] = handler;
       },
       registerCommand: (): void => {},
-      getAllTools: (): Array<{ name: string }> => toolNames.map((name) => ({ name })),
-      setActiveTools: (): void => {},
+      getAllTools: (): Array<{ name: string; exposure?: string }> => toolNames.map((name) => ({
+        name,
+        ...(options.toolExposures?.[name] ? { exposure: options.toolExposures[name] } : {}),
+      })),
+      setActiveTools: (next: string[]): void => {
+        setActiveToolsCalls.push([...next]);
+      },
+      ...(options.activeToolNames === undefined
+        ? {}
+        : { getActiveTools: (): string[] => [...(options.activeToolNames ?? [])] }),
       registerProvider: (): void => {},
       events: {
         emit: (): void => {},
@@ -228,6 +242,7 @@ function createToolCallHarness(
     registeredEvents,
     prompts,
     debugPath,
+    setActiveToolsCalls,
     cleanup: async (): Promise<void> => {
       await Promise.resolve(handlers.session_shutdown?.({}, createMockContext(cwd, prompts, options)));
       if (originalConfigPath === undefined) {
@@ -3553,6 +3568,54 @@ await runAsyncTest("Forwarded permission prompt reflects configured timeout", as
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
     delete process.env[PERMISSION_FORWARDING_AGENT_DIR_ENV_KEY];
+  }
+});
+
+await runAsyncTest("before_agent_start leaves a registered but inactive tool undeclared", async () => {
+  // Distinct tool names keep this case out of the module-level active-tools cache that earlier
+  // tests populate.
+  const harness = createToolCallHarness(
+    {
+      defaultPolicy: { tools: "allow", bash: "allow", mcp: "allow", skills: "allow", special: "allow" },
+    },
+    ["inactive_probe_kept", "inactive_probe_deferred"],
+    {
+      toolExposures: { inactive_probe_deferred: "deferred" },
+      activeToolNames: ["inactive_probe_kept"],
+    },
+  );
+
+  try {
+    const ctx = createMockContext(harness.cwd, harness.prompts);
+    await Promise.resolve(harness.handlers.before_agent_start?.({ systemPrompt: "No skill list" }, ctx));
+
+    assert.equal(harness.setActiveToolsCalls.length, 1, "before_agent_start should set the active tools once");
+    const declared = harness.setActiveToolsCalls[0] ?? [];
+    assert.deepEqual(declared, ["inactive_probe_kept"]);
+    assert.equal(declared.includes("inactive_probe_deferred"), false, "a deferred tool must not be declared");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+await runAsyncTest("before_agent_start still drops a denied tool that is currently active", async () => {
+  const harness = createToolCallHarness(
+    {
+      defaultPolicy: { tools: "allow", bash: "allow", mcp: "allow", skills: "allow", special: "allow" },
+      tools: { deny_probe_dropped: "deny" },
+    },
+    ["deny_probe_kept", "deny_probe_dropped"],
+    { activeToolNames: ["deny_probe_kept", "deny_probe_dropped"] },
+  );
+
+  try {
+    const ctx = createMockContext(harness.cwd, harness.prompts);
+    await Promise.resolve(harness.handlers.before_agent_start?.({ systemPrompt: "No skill list" }, ctx));
+
+    assert.equal(harness.setActiveToolsCalls.length, 1, "before_agent_start should set the active tools once");
+    assert.deepEqual(harness.setActiveToolsCalls[0], ["deny_probe_kept"]);
+  } finally {
+    await harness.cleanup();
   }
 });
 
